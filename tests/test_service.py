@@ -84,6 +84,13 @@ def numbers_at(work: str, known: str) -> dict[str, dict]:
     return {x["number"]: x for x in service.query_effective(work, known)["items"]}
 
 
+def us_before(published: str) -> str:
+    """发布时刻前 1 微秒的规范串：该知悉时刻刚好还看不到这次发布。"""
+    dt = datetime.strptime(published, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+        tzinfo=timezone.utc)
+    return iso_us(dt - timedelta(microseconds=1))
+
+
 class ReleaseTests(unittest.TestCase):
     def setUp(self):
         reset_db()
@@ -298,6 +305,143 @@ class CorrectionTests(unittest.TestCase):
         self.assertEqual(rows["C-2"]["body"], "另一个规程")
 
 
+class DiffTests(unittest.TestCase):
+    """双知悉时刻对比：service.diff_procedure。"""
+
+    def setUp(self):
+        reset_db()
+
+    def test_change_segment_between_two_known_moments(self):
+        release("D-1", body="初版")
+        pub1 = correct("D-1", 0, t2, t3, "三月版")["published_at"]
+        res = service.diff_procedure("D-1", us_before(pub1), pub1, t1, t5)
+        self.assertEqual(res["count"], 1)
+        seg = res["segments"][0]
+        self.assertEqual((seg["start"], seg["end"]), (canon(t2), canon(t3)))
+        self.assertEqual(seg["before"], {"revision": 0, "body": "初版"})
+        self.assertEqual(seg["after"], {"revision": 1, "body": "三月版"})
+        # 回显规范化后的入参
+        self.assertEqual(res["number"], "D-1")
+        self.assertEqual(res["work_start"], canon(t1))
+        self.assertEqual(res["work_end"], canon(t5))
+
+    def test_side_without_applicable_version_is_null(self):
+        release("D-2", body="初版")
+        # 知悉时刻一早于任何发布 -> before 侧无适用版本（null）；
+        # 作业区间超出规程区间之外的部分两侧均无版本 -> 不返回。
+        day = iso(_T + timedelta(days=366))
+        res = service.diff_procedure("D-2", t0, future, t0, day)
+        self.assertEqual(res["count"], 1)
+        seg = res["segments"][0]
+        self.assertEqual((seg["start"], seg["end"]), (canon(t1), canon(t5)))
+        self.assertIsNone(seg["before"])
+        self.assertEqual(seg["after"], {"revision": 0, "body": "初版"})
+
+    def test_both_sides_without_version_not_returned(self):
+        release("D-3")
+        # 两个知悉时刻都早于首次发布（且二者相等，不算顺序颠倒）
+        res = service.diff_procedure("D-3", t0, t0, t1, t5)
+        self.assertEqual(res["count"], 0)
+        self.assertEqual(res["segments"], [])
+
+    def test_same_body_new_revision_still_counts_as_change(self):
+        release("D-4", body="同文")
+        pub1 = correct("D-4", 0, t2, t3, "同文")["published_at"]
+        res = service.diff_procedure("D-4", us_before(pub1), pub1, t2, t3)
+        self.assertEqual(res["count"], 1)
+        seg = res["segments"][0]
+        self.assertEqual(seg["before"], {"revision": 0, "body": "同文"})
+        self.assertEqual(seg["after"], {"revision": 1, "body": "同文"})
+
+    def test_chained_correction_resolves_deepest_on_each_side(self):
+        release("D-5", body="r0")
+        correct("D-5", 0, t2, t4, "r1")
+        pub2 = correct("D-5", 1, t3, t4, "r2")["published_at"]
+        # before 侧只见 r0/r1，after 侧可见到链式更正 r2
+        res = service.diff_procedure("D-5", us_before(pub2), pub2, t1, t5)
+        self.assertEqual(res["count"], 1)
+        seg = res["segments"][0]
+        self.assertEqual((seg["start"], seg["end"]), (canon(t3), canon(t4)))
+        self.assertEqual(seg["before"]["revision"], 1)
+        self.assertEqual(seg["after"]["revision"], 2)
+
+    def test_work_interval_left_closed_right_open(self):
+        release("D-6", body="初版")
+        pub1 = correct("D-6", 0, t2, t3, "三月版")["published_at"]
+        before = us_before(pub1)
+        # 作业区间从更正终点开始（右开）：不含更正 -> 无变化
+        res = service.diff_procedure("D-6", before, pub1, t3, t5)
+        self.assertEqual(res["segments"], [])
+        # 作业区间起于更正起点（左闭）：片段起点恰为更正起点
+        res = service.diff_procedure("D-6", before, pub1, t2,
+                                     iso(_T + timedelta(days=31)))
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["segments"][0]["start"], canon(t2))
+        self.assertEqual(res["segments"][0]["end"],
+                         canon(iso(_T + timedelta(days=31))))
+
+    def test_unaffected_and_out_of_range_parts_dropped(self):
+        release("D-7", body="初版")
+        correct("D-7", 0, t2, t3, "三月版")
+        t4b = iso(_T + timedelta(days=100))
+        pub2 = correct("D-7", 0, t4, t4b, "百日版")["published_at"]
+        # before 侧已含三月版：三月区间两侧相同不返回；只剩百日版这一段
+        res = service.diff_procedure("D-7", us_before(pub2), pub2, t1, t5)
+        self.assertEqual([(s["start"], s["end"]) for s in res["segments"]],
+                         [(canon(t4), canon(t4b))])
+        # 作业区间只罩住百日版右半边：片段被裁剪到作业区间内
+        mid = iso(_T + timedelta(days=95))
+        res = service.diff_procedure("D-7", us_before(pub2), pub2, mid, t5)
+        self.assertEqual([(s["start"], s["end"]) for s in res["segments"]],
+                         [(canon(mid), canon(t4b))])
+
+    def test_adjacent_segments_with_same_change_merge(self):
+        # 合并逻辑：相邻且两侧版本均相同的片段并为一段（最大片段）
+        r0 = {"revision": 0, "body": "x"}
+        r1 = {"revision": 1, "body": "y"}
+        a, b, c = canon(t1), canon(t2), canon(t3)
+        before_cov = [(a, b, r0), (b, c, r0)]
+        after_cov = [(a, c, r1)]
+        segs = service._diff_coverages(before_cov, after_cov)
+        self.assertEqual(len(segs), 1)
+        self.assertEqual((segs[0]["start"], segs[0]["end"]), (a, c))
+        self.assertEqual(segs[0]["before"]["revision"], 0)
+        self.assertEqual(segs[0]["after"]["revision"], 1)
+
+    def test_diff_errors(self):
+        release("D-ERR")
+        # 编号不存在 -> 404 not_found
+        with self.assertRaises(DomainError) as ctx:
+            service.diff_procedure("NOPE", t0, future, t1, t5)
+        self.assertEqual(ctx.exception.code, "not_found")
+        self.assertEqual(ctx.exception.http_status, 404)
+        # 时间缺时区 -> 422 invalid_time
+        with self.assertRaises(DomainError) as ctx:
+            service.diff_procedure("D-ERR", "2026-01-01T00:00:00",
+                                   future, t1, t5)
+        self.assertEqual(ctx.exception.code, "invalid_time")
+        self.assertEqual(ctx.exception.details["field"], "known_as_of_before")
+        # 知悉顺序颠倒 -> 422 invalid_known_order
+        with self.assertRaises(DomainError) as ctx:
+            service.diff_procedure("D-ERR", future, t0, t1, t5)
+        self.assertEqual(ctx.exception.code, "invalid_known_order")
+        self.assertEqual(ctx.exception.http_status, 422)
+        # 作业区间为空（起 == 止 或 起 > 止）-> 422 invalid_interval
+        for ws, we in ((t2, t2), (t3, t2)):
+            with self.assertRaises(DomainError) as ctx:
+                service.diff_procedure("D-ERR", t0, future, ws, we)
+            self.assertEqual(ctx.exception.code, "invalid_interval")
+            self.assertEqual(ctx.exception.http_status, 422)
+
+    def test_diff_does_not_write_history(self):
+        release("D-H", body="初版")
+        pub1 = correct("D-H", 0, t2, t3, "三月版")["published_at"]
+        before = service.list_history("D-H")
+        service.diff_procedure("D-H", us_before(pub1), pub1, t1, t5)
+        service.diff_procedure("D-H", t0, future, t1, t5)
+        self.assertEqual(service.list_history("D-H"), before)
+
+
 class ApiTests(unittest.TestCase):
     """FastAPI 层：仅在依赖可用时运行。"""
 
@@ -384,6 +528,70 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["count"], 0)
         self.assertEqual(r.json()["items"], [])
+
+    def test_diff_over_http(self):
+        c = self.client
+        n = self._n()
+        r = c.post("/api/v1/releases", json={
+            "number": n, "body": "初版", "valid_start": t1, "valid_end": t5})
+        self.assertEqual(r.status_code, 201)
+        r = c.post("/api/v1/corrections", json={
+            "number": n, "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "三月版"})
+        self.assertEqual(r.status_code, 201)
+        pub1 = r.json()["published_at"]
+
+        # 更正发布前 1 微秒 vs 发布时刻：仅更正子区间发生变化
+        r = c.get(f"/api/v1/procedures/{n}/diff", params={
+            "known_as_of_before": us_before(pub1),
+            "known_as_of_after": pub1,
+            "work_start": t1, "work_end": t5})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["count"], 1)
+        seg = body["segments"][0]
+        self.assertEqual((seg["start"], seg["end"]), (canon(t2), canon(t3)))
+        self.assertEqual(seg["before"], {"revision": 0, "body": "初版"})
+        self.assertEqual(seg["after"], {"revision": 1, "body": "三月版"})
+
+        # 知悉时刻早于任何发布：before 侧为 null
+        r = c.get(f"/api/v1/procedures/{n}/diff", params={
+            "known_as_of_before": t0, "known_as_of_after": pub1,
+            "work_start": t2, "work_end": t3})
+        self.assertEqual(r.status_code, 200)
+        seg = r.json()["segments"][0]
+        self.assertIsNone(seg["before"])
+        self.assertEqual(seg["after"]["revision"], 1)
+
+        # 对比是只读的：历史不变
+        r = c.get(f"/api/v1/procedures/{n}/history")
+        self.assertEqual(r.json()["count"], 2)
+
+        # 编号不存在 -> 404 not_found
+        r = c.get("/api/v1/procedures/NO-SUCH/diff", params={
+            "known_as_of_before": t0, "known_as_of_after": future,
+            "work_start": t1, "work_end": t5})
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "not_found")
+        # 知悉顺序颠倒 -> 422 invalid_known_order
+        r = c.get(f"/api/v1/procedures/{n}/diff", params={
+            "known_as_of_before": future, "known_as_of_after": t0,
+            "work_start": t1, "work_end": t5})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_known_order")
+        # 作业区间为空 -> 422 invalid_interval
+        r = c.get(f"/api/v1/procedures/{n}/diff", params={
+            "known_as_of_before": t0, "known_as_of_after": future,
+            "work_start": t2, "work_end": t2})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_interval")
+        # 时间缺时区 -> 422 invalid_time
+        r = c.get(f"/api/v1/procedures/{n}/diff", params={
+            "known_as_of_before": "2026-01-01T00:00:00",
+            "known_as_of_after": future,
+            "work_start": t1, "work_end": t5})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_time")
 
 
 if __name__ == "__main__":

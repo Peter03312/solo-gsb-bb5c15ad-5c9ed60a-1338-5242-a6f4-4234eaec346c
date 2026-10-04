@@ -81,3 +81,11 @@ curl -sS -X POST "$BASE_URL/api/v1/corrections" \
 
 # --- 8. 版本历史（审计视图） --------------------------------------------
 curl -sS "$BASE_URL/api/v1/procedures/SOP-CURL-001/history"; echo
+
+# --- 9. 双知悉时刻对比：同一作业期间在两个知悉时刻之间的适用内容变化 -----
+# 知悉时刻一 2025-06-01：任何版本尚未发布 -> 该侧为 null；
+# 知悉时刻二 2027-01-01：全部版本已发布。作业期间为 2026 全年。
+# 预期返回 6 段：初版覆盖的 3 段（1-2 月 / 4 月 / 7-12 月）+ 3 段更正
+# （3 月 / 5 月 / 6 月），before 均为 null（null -> 某版本即"新可见"的变化）。
+# （带偏移的时区需 URL 编码，如 %2B08:00；此处统一用 Z。）
+curl -sS "$BASE_URL/api/v1/procedures/SOP-CURL-001/diff?known_as_of_before=2025-06-01T00:00:00Z&known_as_of_after=2027-01-01T00:00:00Z&work_start=2026-01-01T00:00:00Z&work_end=2027-01-01T00:00:00Z"; echo

@@ -354,6 +354,149 @@ def query_effective(work_time_raw: str, known_as_of_raw: str | None) -> dict:
     return {"work_time": work_time, "known_as_of": known_as_of,
             "count": len(items), "items": items}
 
+# ---------------------------------------------------------------- 双知悉时刻对比
+
+
+def _parse_moment(raw: str, field: str) -> str:
+    """解析外部传入的知悉/作业时刻；不合法抛 invalid_time。"""
+    try:
+        return parse_canonical(raw, field)
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422, {"field": field})
+
+
+def _coverage_at(rows: list[sqlite3.Row], known_as_of: str,
+                 work_start: str,
+                 work_end: str) -> list[tuple[str, str, sqlite3.Row | None]]:
+    """截至 known_as_of 已发布版本对作业区间 [work_start, work_end) 的覆盖。
+
+    返回 ``[(start, end, row|None), ...]``：互不相交且铺满整个作业区间；
+    row 为该片段内沿更正链可见的最深版本（父版本区间扣除其可见子更正），
+    None 表示该片段在该知悉时刻无任何适用版本。
+    """
+    visible = [r for r in rows if r["published_at"] <= known_as_of]
+    children: dict[int, list[sqlite3.Row]] = {}
+    for r in visible:
+        pid = r["supersedes_id"]
+        if pid is not None:
+            children.setdefault(pid, []).append(r)
+    pieces: list[tuple[str, str, sqlite3.Row]] = []
+    for r in visible:
+        holes = [(c["valid_start"], c["valid_end"])
+                 for c in children.get(r["id"], [])]
+        for s, e in _subtract_intervals((r["valid_start"], r["valid_end"]),
+                                        holes):
+            lo = s if s > work_start else work_start
+            hi = e if e < work_end else work_end
+            if lo < hi:
+                pieces.append((lo, hi, r))
+    pieces.sort(key=lambda p: (p[0], p[1]))
+    segments: list[tuple[str, str, sqlite3.Row | None]] = []
+    cursor = work_start
+    for s, e, r in pieces:
+        if cursor < s:
+            segments.append((cursor, s, None))
+        segments.append((s, e, r))
+        cursor = e
+    if cursor < work_end:
+        segments.append((cursor, work_end, None))
+    return segments
+
+
+def _side_view(row: sqlite3.Row | None) -> dict | None:
+    """片段一侧的版本视图；该侧无适用版本时为 None（JSON null）。"""
+    if row is None:
+        return None
+    return {"revision": row["revision"], "body": row["body"]}
+
+
+def _diff_coverages(before_cov: list, after_cov: list) -> list[dict]:
+    """把两侧覆盖切分为原子片段，筛出发生变化的并合并为最大片段。
+
+    两侧版本号相同（含均无版本）的片段不返回；相邻且两侧版本号均相同
+    （即变化内容一致）的片段合并为一段。版本号不同即算变化，
+    与正文是否相同无关。
+    """
+    def version_at(cov: list, s: str, e: str):
+        for ps, pe, r in cov:
+            if ps <= s and e <= pe:
+                return r
+        return None  # 覆盖铺满作业区间，理论不可达
+
+    bounds = sorted({p[0] for p in before_cov + after_cov}
+                    | {p[1] for p in before_cov + after_cov})
+    # [start, end, before_key, after_key, before_row, after_row]
+    merged: list[list] = []
+    for s, e in zip(bounds, bounds[1:]):
+        if not s < e:
+            continue
+        b_row = version_at(before_cov, s, e)
+        a_row = version_at(after_cov, s, e)
+        b_key = b_row["revision"] if b_row is not None else None
+        a_key = a_row["revision"] if a_row is not None else None
+        if b_key == a_key:
+            continue
+        if (merged and merged[-1][1] == s
+                and merged[-1][2] == b_key and merged[-1][3] == a_key):
+            merged[-1][1] = e  # 相邻且两侧版本均相同：并入上一段
+        else:
+            merged.append([s, e, b_key, a_key, b_row, a_row])
+    return [{"start": s, "end": e,
+             "before": _side_view(b_row), "after": _side_view(a_row)}
+            for s, e, _bk, _ak, b_row, a_row in merged]
+
+
+def diff_procedure(number_raw: str, known_before_raw: str,
+                   known_after_raw: str, work_start_raw: str,
+                   work_end_raw: str) -> dict:
+    """比较同一规程在两个知悉时刻对一段作业期间的实际适用内容（只读）。
+
+    各侧状态沿更正链按发布时间还原（``published_at <= 知悉时刻`` 的版本
+    可见，同一作业时刻取链上最深者）；作业区间左闭右开。返回发生变化的
+    最大片段：逐段给出片段起止与两侧可见的版本号/正文，某侧无适用版本
+    以 null 表示；两侧版本相同（含均无版本）的片段不返回；同正文的新
+    版本（revision 不同）仍算变化。本函数不写入任何历史。
+    """
+    number = number_raw.strip() if isinstance(number_raw, str) else ""
+    if not number:
+        raise DomainError("invalid_number", "规程编号不能为空字符串", 422,
+                          {"field": "number"})
+    known_before = _parse_moment(known_before_raw, "known_as_of_before")
+    known_after = _parse_moment(known_after_raw, "known_as_of_after")
+    if known_before > known_after:
+        raise DomainError(
+            "invalid_known_order",
+            "知悉时刻顺序颠倒：known_as_of_before 必须不晚于 known_as_of_after",
+            422, {"known_as_of_before": known_before,
+                  "known_as_of_after": known_after})
+    work_start = _parse_moment(work_start_raw, "work_start")
+    work_end = _parse_moment(work_end_raw, "work_end")
+    if not work_start < work_end:
+        raise errors.invalid_interval(
+            work_start, work_end,
+            "作业区间非法：起点必须严格早于终点（区间为 [起, 止) 且长度大于 0）")
+
+    with read_conn() as conn:
+        proc = _fetch_procedure(conn, number)
+        if proc is None:
+            raise DomainError("not_found", f"规程编号 {number} 不存在",
+                              404, {"number": number})
+        rows = conn.execute(
+            "SELECT * FROM versions WHERE procedure_id = ?",
+            (proc["id"],)).fetchall()
+
+    before_cov = _coverage_at(rows, known_before, work_start, work_end)
+    after_cov = _coverage_at(rows, known_after, work_start, work_end)
+    segments = _diff_coverages(before_cov, after_cov)
+    return {"number": number,
+            "known_as_of_before": known_before,
+            "known_as_of_after": known_after,
+            "work_start": work_start,
+            "work_end": work_end,
+            "count": len(segments),
+            "segments": segments}
+
+
 # ---------------------------------------------------------------- 历史查看
 
 

@@ -10,6 +10,7 @@ import json
 import sys
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
 
@@ -52,6 +53,7 @@ def main() -> None:
         "body": "更正正文：3 月检修期还须穿戴防割手套。",
     })
     show("2. 提交更正（子区间）", status, res)
+    correction_pub = res["published_at"]  # 留作第 9 步对比用
 
     # 3) 查询：2 月（更正区间之外）-> 仍是初版
     status, res = call("GET", "/api/v1/effective?work_time=2026-02-15T08:00:00Z")
@@ -111,6 +113,21 @@ def main() -> None:
     status, res = call("GET",
                        "/api/v1/procedures/" + number + "/history")
     show("8. 版本历史", status, res)
+
+    # 9) 双知悉时刻对比：同一作业期间（2026 全年）在"更正发布前 1 微秒"与
+    #    "更正发布时刻"两个知悉时刻之间，实际适用内容发生变化的片段。
+    #    预期只有 3 月子区间一段：before=r0 初版 -> after=r1 更正。
+    dt = datetime.strptime(correction_pub, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+        tzinfo=timezone.utc)
+    just_before = (dt - timedelta(microseconds=1)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ")
+    status, res = call("GET",
+                       "/api/v1/procedures/" + number + "/diff"
+                       "?known_as_of_before=" + just_before +
+                       "&known_as_of_after=" + correction_pub +
+                       "&work_start=2026-01-01T00:00:00Z"
+                       "&work_end=2027-01-01T00:00:00Z")
+    show("9. 双知悉时刻对比（更正发布前后）", status, res)
 
 
 if __name__ == "__main__":

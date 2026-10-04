@@ -16,7 +16,7 @@ app = FastAPI(
     title="安全作业规程历史回溯服务",
     version="1.0.0",
     description=("双时间维（适用时间 / 发布时间）规程版本库：首次发布、更正、"
-                 "按作业时刻+知悉时刻回溯查询。"),
+                 "按作业时刻+知悉时刻回溯查询、双知悉时刻作业期间对比。"),
 )
 
 
@@ -57,6 +57,7 @@ def index() -> dict:
                 "POST /api/v1/releases",
                 "POST /api/v1/corrections",
                 "GET  /api/v1/effective",
+                "GET  /api/v1/procedures/{number}/diff",
                 "GET  /api/v1/procedures/{number}/history",
             ]}
 
@@ -95,6 +96,15 @@ async def create_correction(request: Request) -> dict:
 def effective(work_time: str, known_as_of: str | None = None) -> dict:
     """回溯查询：截至 known_as_of 已发布、且在 work_time 有效的正文与版本。"""
     return service.query_effective(work_time, known_as_of)
+
+
+@app.get("/api/v1/procedures/{number}/diff")
+def procedure_diff(number: str, known_as_of_before: str, known_as_of_after: str,
+                   work_start: str, work_end: str) -> dict:
+    """双知悉时刻对比：同一规程在作业期间 [work_start, work_end) 内，
+    两个知悉时刻各自实际适用的版本/正文之差异片段（只读，不写历史）。"""
+    return service.diff_procedure(number, known_as_of_before,
+                                  known_as_of_after, work_start, work_end)
 
 
 @app.get("/api/v1/procedures/{number}/history")
