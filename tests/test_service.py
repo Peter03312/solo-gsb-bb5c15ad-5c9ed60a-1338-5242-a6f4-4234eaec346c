@@ -298,6 +298,149 @@ class CorrectionTests(unittest.TestCase):
         self.assertEqual(rows["C-2"]["body"], "另一个规程")
 
 
+class CompareTests(unittest.TestCase):
+    """两知悉时刻作业区间对比。"""
+
+    def setUp(self):
+        reset_db()
+        release("D-1", body="初版")
+
+    def test_before_release_whole_window_null_to_versions(self):
+        # 前侧知悉时刻早于任何发布：三段（r1 更正段把两侧同为 null->r0 的段隔开）
+        correct("D-1", 0, t2, t3, "三月版")
+        res = service.compare_interval("D-1", t0, future, t1, t5)
+        self.assertEqual(res["count"], 3)
+        segs = [(s["start"], s["end"],
+                 s["before"], s["after"]["revision"]) for s in res["segments"]]
+        self.assertEqual([s[2] for s in segs], [None, None, None])
+        self.assertEqual([s[3] for s in segs], [0, 1, 0])
+        self.assertEqual([(s[0], s[1]) for s in segs],
+                         [(canon(t1), canon(t2)),
+                          (canon(t2), canon(t3)),
+                          (canon(t3), canon(t5))])
+        self.assertEqual(res["segments"][1]["after"]["body"], "三月版")
+
+    def test_correction_between_known_times_single_segment(self):
+        published = correct("D-1", 0, t2, t3, "三月版")["published_at"]
+        dt = datetime.strptime(published, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc)
+        before = iso_us(dt - timedelta(microseconds=1))
+        res = service.compare_interval("D-1", before, future, t1, t5)
+        self.assertEqual(res["count"], 1)
+        seg = res["segments"][0]
+        self.assertEqual((seg["start"], seg["end"]), (canon(t2), canon(t3)))
+        self.assertEqual(seg["before"]["revision"], 0)
+        self.assertEqual(seg["before"]["body"], "初版")
+        self.assertEqual(seg["after"]["revision"], 1)
+        self.assertEqual(seg["after"]["body"], "三月版")
+
+    def test_visibility_boundary_published_at_inclusive(self):
+        # 前侧取更正发布时刻本身（published_at <= known 含等号）-> 已可见，无差异
+        published = correct("D-1", 0, t2, t3, "三月版")["published_at"]
+        res = service.compare_interval("D-1", published, future, t1, t5)
+        self.assertEqual(res["count"], 0)
+        self.assertEqual(res["segments"], [])
+
+    def test_same_body_new_revision_still_a_change(self):
+        correct("D-1", 0, t2, t3, "初版")   # 正文与 r0 完全相同
+        res = service.compare_interval("D-1", t0, future, t1, t5)
+        changed = [s for s in res["segments"]
+                   if s["before"] is None and s["after"]["revision"] == 1]
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0]["after"]["body"], "初版")
+
+    def test_partial_work_window_clipped(self):
+        correct("D-1", 0, t2, t3, "三月版")
+        ws = iso(_T + timedelta(days=15))
+        we = iso(_T + timedelta(days=45))
+        res = service.compare_interval("D-1", t0, future, ws, we)
+        self.assertEqual(res["count"], 2)
+        self.assertEqual([(s["start"], s["end"]) for s in res["segments"]],
+                         [(canon(ws), canon(t2)), (canon(t2), canon(we))])
+
+    def test_chained_corrections_separate_segments(self):
+        correct("D-1", 0, t2, t4, "r1")
+        correct("D-1", 1, t3, t4, "r2")
+        res = service.compare_interval("D-1", t0, future, t1, t5)
+        pairs = [(s["start"], s["after"]["revision"]) for s in res["segments"]]
+        self.assertEqual(pairs,
+                         [(canon(t1), 0), (canon(t2), 1), (canon(t3), 2),
+                          (canon(t4), 0)])
+        # 前侧全空；两段 after=r0 被不同版本隔开，不得跨段合并
+        self.assertTrue(all(s["before"] is None for s in res["segments"]))
+
+    def test_no_change_returns_empty(self):
+        correct("D-1", 0, t2, t3, "三月版")
+        # 两个知悉时刻都在更正发布之后（须严格先后；future = T+400d）
+        after1 = iso(_T + timedelta(days=300))
+        res = service.compare_interval("D-1", after1, future, t1, t5)
+        self.assertEqual(res["count"], 0)
+        # 作业区间完全在任何适用区间之外：两侧均无版本，也不返回
+        res = service.compare_interval(
+            "D-1", t0, future, iso(_T + timedelta(days=800)),
+            iso(_T + timedelta(days=900)))
+        self.assertEqual(res["count"], 0)
+
+    def test_offset_timezone_normalized(self):
+        correct("D-1", 0, t2, t3, "三月版")
+        res = service.compare_interval(
+            "D-1",
+            "2025-12-31T16:00:00-08:00",       # == 2026-01-01T00:00:00Z（早于发布）
+            future,
+            "2026-01-31T08:00:00+08:00",       # == 2026-01-31T00:00:00Z == t2（含）
+            "2026-03-02T08:00:00+08:00")       # == 2026-03-02T00:00:00Z == t3（不含）
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["segments"][0]["after"]["revision"], 1)
+
+    def test_error_unknown_number(self):
+        with self.assertRaises(DomainError) as ctx:
+            service.compare_interval("NOPE", t0, future, t1, t2)
+        self.assertEqual(ctx.exception.code, "not_found")
+        self.assertEqual(ctx.exception.http_status, 404)
+
+    def test_error_naive_time_rejected(self):
+        with self.assertRaises(DomainError) as ctx:
+            service.compare_interval(
+                "D-1", "2026-01-01T00:00:00", future, t1, t2)
+        self.assertEqual(ctx.exception.code, "invalid_time")
+        self.assertEqual(ctx.exception.details["field"], "known_before")
+        with self.assertRaises(DomainError) as ctx:
+            service.compare_interval(
+                "D-1", t0, future, "2026-01-01T00:00:00", t2)
+        self.assertEqual(ctx.exception.details["field"], "work_start")
+
+    def test_error_known_order_reversed_or_equal(self):
+        with self.assertRaises(DomainError) as ctx:
+            service.compare_interval("D-1", future, t0, t1, t2)
+        self.assertEqual(ctx.exception.code, "invalid_known_order")
+        self.assertEqual(ctx.exception.http_status, 422)
+        with self.assertRaises(DomainError) as ctx:
+            service.compare_interval("D-1", future, future, t1, t2)
+        self.assertEqual(ctx.exception.code, "invalid_known_order")
+
+    def test_error_empty_work_interval(self):
+        with self.assertRaises(DomainError) as ctx:
+            service.compare_interval("D-1", t0, future, t2, t2)
+        self.assertEqual(ctx.exception.code, "invalid_interval")
+        with self.assertRaises(DomainError) as ctx:
+            service.compare_interval("D-1", t0, future, t3, t2)
+        self.assertEqual(ctx.exception.code, "invalid_interval")
+
+    def test_read_only_on_error(self):
+        # 非法请求前后历史完全一致
+        before = service.list_history("D-1")
+        with self.assertRaises(DomainError):
+            service.compare_interval("D-1", future, t0, t1, t2)
+        self.assertEqual(service.list_history("D-1"), before)
+
+    def test_merge_adjacent_helper(self):
+        segs = service._merge_adjacent([
+            (t1, t2, None, 0), (t2, t3, None, 0), (t3, t4, 0, 0),
+            (t4, t5, 0, 1)])
+        self.assertEqual(segs, [(t1, t3, None, 0), (t3, t4, 0, 0),
+                                (t4, t5, 0, 1)])
+
+
 class ApiTests(unittest.TestCase):
     """FastAPI 层：仅在依赖可用时运行。"""
 
@@ -376,6 +519,60 @@ class ApiTests(unittest.TestCase):
             "published_at": "2000-01-01T00:00:00Z"})
         self.assertEqual(r.status_code, 422)
         self.assertEqual(r.json()["error"]["code"], "validation_error")
+
+    def test_diff_over_http(self):
+        c = self.client
+        n = self._n()
+        c.post("/api/v1/releases", json={
+            "number": n, "body": "初版", "valid_start": t1, "valid_end": t5})
+        c.post("/api/v1/corrections", json={
+            "number": n, "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "三月版"})
+
+        # 前侧早于发布 -> 三段 null->r0/r1/r0
+        r = c.get(f"/api/v1/procedures/{n}/diff", params={
+            "known_before": t0, "known_after": future,
+            "work_start": t1, "work_end": t5})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["count"], 3)
+        self.assertEqual([s["after"]["revision"] for s in body["segments"]],
+                         [0, 1, 0])
+        self.assertTrue(all(s["before"] is None
+                            for s in body["segments"]))
+
+        # 编号不存在 -> 404，不区分入参先后
+        r = c.get("/api/v1/procedures/NO-SUCH/diff", params={
+            "known_before": t0, "known_after": future,
+            "work_start": t1, "work_end": t5})
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "not_found")
+
+        # 知悉顺序颠倒 -> 422 invalid_known_order
+        r = c.get(f"/api/v1/procedures/{n}/diff", params={
+            "known_before": future, "known_after": t0,
+            "work_start": t1, "work_end": t5})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_known_order")
+
+        # 空作业区间 -> 422 invalid_interval
+        r = c.get(f"/api/v1/procedures/{n}/diff", params={
+            "known_before": t0, "known_after": future,
+            "work_start": t2, "work_end": t2})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_interval")
+
+        # 无时区 -> 422 invalid_time
+        r = c.get(f"/api/v1/procedures/{n}/diff", params={
+            "known_before": "2026-01-01T00:00:00", "known_after": future,
+            "work_start": t1, "work_end": t5})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_time")
+
+        # 缺少必填参数 -> 422 validation_error
+        r = c.get(f"/api/v1/procedures/{n}/diff", params={
+            "known_before": t0, "work_start": t1, "work_end": t5})
+        self.assertEqual(r.status_code, 422)
 
     def test_health_and_empty_result(self):
         self.assertEqual(self.client.get("/health").json()["status"], "ok")

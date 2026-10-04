@@ -58,6 +58,7 @@ def index() -> dict:
                 "POST /api/v1/corrections",
                 "GET  /api/v1/effective",
                 "GET  /api/v1/procedures/{number}/history",
+                "GET  /api/v1/procedures/{number}/diff",
             ]}
 
 
@@ -101,3 +102,16 @@ def effective(work_time: str, known_as_of: str | None = None) -> dict:
 def procedure_history(number: str) -> dict:
     """审计视图：某规程的全部版本（含尚未对旧知悉时刻可见的版本）。"""
     return service.list_history(number)
+
+
+@app.get("/api/v1/procedures/{number}/diff")
+def procedure_diff(number: str, known_before: str, known_after: str,
+                   work_start: str, work_end: str) -> dict:
+    """两知悉时刻对比：同一规程在作业区间 [work_start, work_end) 内，
+    先后两个知悉时刻可见的实际适用正文发生变化的最大片段。
+
+    时间均须为 ISO-8601 带时区；known_before 必须严格早于 known_after；
+    作业区间非空。编号不存在返回 404，其余非法入参返回 422；均不写历史。
+    """
+    return service.compare_interval(number, known_before, known_after,
+                                    work_start, work_end)

@@ -81,3 +81,32 @@ curl -sS -X POST "$BASE_URL/api/v1/corrections" \
 
 # --- 8. 版本历史（审计视图） --------------------------------------------
 curl -sS "$BASE_URL/api/v1/procedures/SOP-CURL-001/history"; echo
+
+# --- 9a. 两知悉时刻对比：前侧取发布之前，作业区间覆盖全年 ---------------
+#       只有更正子区间（3 月）两侧版本不同；before 为 null（当时无任何版本）
+curl -sS --get "$BASE_URL/api/v1/procedures/SOP-CURL-001/diff" \
+  --data-urlencode 'known_before=2025-01-01T00:00:00Z' \
+  --data-urlencode 'known_after=2030-01-01T00:00:00Z' \
+  --data-urlencode 'work_start=2026-01-01T00:00:00Z' \
+  --data-urlencode 'work_end=2027-01-01T00:00:00Z'; echo
+
+# --- 9b. 收窄作业区间到 2-5 月：null→r0 与 null→r1 两段 -----------------
+curl -sS --get "$BASE_URL/api/v1/procedures/SOP-CURL-001/diff" \
+  --data-urlencode 'known_before=2025-01-01T00:00:00Z' \
+  --data-urlencode 'known_after=2030-01-01T00:00:00Z' \
+  --data-urlencode 'work_start=2026-02-01T00:00:00Z' \
+  --data-urlencode 'work_end=2026-05-01T00:00:00Z'; echo
+
+# --- 9c. 知悉顺序颠倒 -> 422 invalid_known_order（不写历史） -------------
+curl -sS -i --get "$BASE_URL/api/v1/procedures/SOP-CURL-001/diff" \
+  --data-urlencode 'known_before=2030-01-01T00:00:00Z' \
+  --data-urlencode 'known_after=2025-01-01T00:00:00Z' \
+  --data-urlencode 'work_start=2026-01-01T00:00:00Z' \
+  --data-urlencode 'work_end=2027-01-01T00:00:00Z'; echo
+
+# --- 9d. 空作业区间（起=止） -> 422 invalid_interval ---------------------
+curl -sS -i --get "$BASE_URL/api/v1/procedures/SOP-CURL-001/diff" \
+  --data-urlencode 'known_before=2025-01-01T00:00:00Z' \
+  --data-urlencode 'known_after=2030-01-01T00:00:00Z' \
+  --data-urlencode 'work_start=2026-03-01T00:00:00Z' \
+  --data-urlencode 'work_end=2026-03-01T00:00:00Z'; echo

@@ -52,6 +52,7 @@ def main() -> None:
         "body": "更正正文：3 月检修期还须穿戴防割手套。",
     })
     show("2. 提交更正（子区间）", status, res)
+    published_r1 = res["items"][0]["published_at"]
 
     # 3) 查询：2 月（更正区间之外）-> 仍是初版
     status, res = call("GET", "/api/v1/effective?work_time=2026-02-15T08:00:00Z")
@@ -111,6 +112,53 @@ def main() -> None:
     status, res = call("GET",
                        "/api/v1/procedures/" + number + "/history")
     show("8. 版本历史", status, res)
+
+    # 9) 两知悉时刻作业区间对比（见文件下方 _diff_examples）
+    _diff_examples(number, published_r1)
+
+
+def _diff_examples(number: str, published_r1: str) -> None:
+    """对比接口示例：known_before / known_after 卡在 r1 发布时刻前后一微秒。"""
+    import urllib.parse
+    from datetime import datetime, timedelta, timezone
+
+    def us_iso(canonical: str, delta_microseconds: int) -> str:
+        dt = datetime.strptime(canonical, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc)
+        return (dt + timedelta(microseconds=delta_microseconds)).strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ")
+
+    # 9a) 全年作业区间：只有 3 月这一段在两侧分别是 r0 / r1；
+    #     两侧同为 r0 的相邻部分不返回
+    q = urllib.parse.urlencode({
+        "known_before": us_iso(published_r1, -1),
+        "known_after": us_iso(published_r1, 1),
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+    })
+    status, res = call("GET", f"/api/v1/procedures/{number}/diff?{q}")
+    show("9a. 两知悉时刻对比（全年区间，仅 3 月段 r0→r1）", status, res)
+
+    # 9b) 前侧取很早以前（一切版本均未发布）：before=null 逐段列出。
+    #     作业区间只问 2-5 月，其中 r1 还被第 7 步的 r2 切成 r1/r2/r1 三段
+    q = urllib.parse.urlencode({
+        "known_before": "2025-01-01T00:00:00Z",
+        "known_after": "2030-01-01T00:00:00Z",
+        "work_start": "2026-02-01T00:00:00Z",
+        "work_end": "2026-05-01T00:00:00Z",
+    })
+    status, res = call("GET", f"/api/v1/procedures/{number}/diff?{q}")
+    show("9b. 前侧无任何可见版本（before 为 null 也逐段列出）", status, res)
+
+    # 9c) 知悉顺序颠倒 -> 422 invalid_known_order，不写历史
+    q = urllib.parse.urlencode({
+        "known_before": "2030-01-01T00:00:00Z",
+        "known_after": "2025-01-01T00:00:00Z",
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+    })
+    status, res = call("GET", f"/api/v1/procedures/{number}/diff?{q}")
+    show("9c. 知悉顺序颠倒被拒绝", status, res)
 
 
 if __name__ == "__main__":

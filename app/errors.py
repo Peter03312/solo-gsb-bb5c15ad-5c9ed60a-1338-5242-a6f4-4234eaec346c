@@ -28,6 +28,13 @@ def invalid_interval(start: str, end: str, reason: str,
     return DomainError("invalid_interval", reason, http_status=422, details=details)
 
 
+def invalid_known_order(before: str, after: str) -> DomainError:
+    details = {"known_before": before, "known_after": after,
+               "reason": "知悉时刻顺序非法：known_before 必须严格早于 known_after"}
+    return DomainError("invalid_known_order",
+                       details["reason"], http_status=422, details=details)
+
+
 def procedure_not_found(number: str, at_index: int | None = None) -> DomainError:
     details = {"number": number}
     if at_index is not None:

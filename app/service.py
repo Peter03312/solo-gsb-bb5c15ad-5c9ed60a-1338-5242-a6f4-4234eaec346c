@@ -25,7 +25,6 @@ from . import errors
 from .db import read_conn, write_tx
 from .errors import DomainError
 from .time_utils import TimeParseError, now_canonical, parse_canonical
-
 # ---------------------------------------------------------------- 服务端时钟
 
 # 写操作由全局锁串行化；时钟同样保证单调递增，避免连续两次发布落在同一微秒
@@ -279,6 +278,53 @@ def _serialize(row: sqlite3.Row,
     }
 
 
+def _depth_of(version_id: int, by_id: dict[int, sqlite3.Row],
+              depth_cache: dict[int, int]) -> int:
+    """版本在替代链（correction chain）上的深度：首版为 1，每被更正一次 +1。
+
+    作业时刻有效版本即所有覆盖该时刻的可见版本中链上最深者。
+    """
+    chain: list[int] = []
+    cur_id: int | None = version_id
+    while cur_id is not None and cur_id not in depth_cache:
+        chain.append(cur_id)
+        parent = by_id[cur_id]["supersedes_id"]
+        cur_id = parent if parent is not None else None
+    base = depth_cache[cur_id] if cur_id is not None else 0
+    for vid in reversed(chain):
+        base += 1
+        depth_cache[vid] = base
+    return depth_cache[version_id]
+
+
+def _effective_at(t: str, candidates: list[sqlite3.Row],
+                  by_id: dict[int, sqlite3.Row],
+                  depth_cache: dict[int, int]) -> sqlite3.Row | None:
+    """作业时刻 t 处沿更正链取最深的可见版本；无版本覆盖返回 None。
+
+    左闭右开：valid_start <= t < valid_end。同深度仅作确定性兜底
+    （同一父版本的更正区间互不重叠，正常数据下同深度候选只会有一个）。
+    """
+    best: sqlite3.Row | None = None
+    best_depth = 0
+    for r in candidates:
+        if r["valid_start"] <= t < r["valid_end"]:
+            d = _depth_of(r["id"], by_id, depth_cache)
+            if (best is None or d > best_depth
+                    or (d == best_depth
+                        and (r["revision"], r["published_at"])
+                        > (best["revision"], best["published_at"]))):
+                best, best_depth = r, d
+    return best
+
+
+def _visible_versions(conn: sqlite3.Connection, proc_id: int,
+                      known_as_of: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM versions WHERE procedure_id = ? AND published_at <= ?",
+        (proc_id, known_as_of)).fetchall()
+
+
 def query_effective(work_time_raw: str, known_as_of_raw: str | None) -> dict:
     """返回截至知悉时刻已发布、且在作业时刻有效的各规程正文与版本。"""
     try:
@@ -322,23 +368,11 @@ def query_effective(work_time_raw: str, known_as_of_raw: str | None) -> dict:
         parent_rev = {v["id"]: v["revision"] for v in all_versions}
         depth_cache: dict[int, int] = {}
 
-        def depth(v: sqlite3.Row) -> int:
-            chain: list[int] = []
-            cur: sqlite3.Row | None = v
-            while cur is not None and cur["id"] not in depth_cache:
-                chain.append(cur["id"])
-                cur = by_id.get(cur["supersedes_id"]) if cur["supersedes_id"] is not None else None
-            base = depth_cache[cur["id"]] if cur is not None else 0
-            for vid in reversed(chain):
-                base += 1
-                depth_cache[vid] = base
-            return depth_cache[v["id"]]
-
         best: dict[int, sqlite3.Row] = {}
         best_depth: dict[int, int] = {}
         for r in rows:
             pid = r["procedure_id"]
-            d = depth(r)
+            d = _depth_of(r["id"], by_id, depth_cache)
             cur = best.get(pid)
             if (cur is None or d > best_depth[pid]
                     # 同深度理论上不会出现（覆盖互不重叠）；以下仅为确定性兜底
@@ -384,3 +418,116 @@ def list_history(number_raw: str) -> dict:
                     parent_rev[prow["id"]] = prow["revision"]
         items = [_serialize(r, parent_rev) for r in rows]
     return {"number": number, "count": len(items), "items": items}
+
+
+# ---------------------------------------------------------------- 两知悉时刻区间对比
+
+
+def _merge_adjacent(segments: list[tuple[str, str, int | None, int | None]]
+                    ) -> list[tuple[str, str, int | None, int | None]]:
+    """合并首尾相接且两侧版本完全相同的相邻片段（区间均为左闭右开）。"""
+    merged: list[tuple[str, str, int | None, int | None]] = []
+    for seg in segments:
+        s, e, left, right = seg
+        if merged and merged[-1][1] == s and merged[-1][2:] == (left, right):
+            merged[-1] = (merged[-1][0], e, left, right)
+        else:
+            merged.append(seg)
+    return merged
+
+
+def compare_interval(number_raw: str,
+                     known_before_raw: str,
+                     known_after_raw: str,
+                     work_start_raw: str,
+                     work_end_raw: str) -> dict:
+    """比较同一规程在先后两个知悉时刻、对作业区间 [work_start, work_end) 的
+    实际适用内容，逐段返回两侧可见版本不同的最大片段。
+
+    各侧状态按发布时间（published_at <= 知悉时刻）沿更正链还原：
+    覆盖同一作业时刻的候选版本中，链上最深者为该时刻的有效版本；
+    无任何可见版本覆盖时该侧记为空（revision/body 均为 null）。
+    """
+    # 入参全部校验通过后再查库；任何非法输入均只读、不写历史。
+    number = number_raw.strip()
+    try:
+        work_start = parse_canonical(work_start_raw, "work_start")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "work_start"})
+    try:
+        work_end = parse_canonical(work_end_raw, "work_end")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "work_end"})
+    if not work_start < work_end:
+        raise errors.invalid_interval(
+            work_start, work_end,
+            "作业区间非法：work_start 必须严格早于 work_end（区间为 [起, 止) 且长度大于 0）")
+    try:
+        known_before = parse_canonical(known_before_raw, "known_before")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "known_before"})
+    try:
+        known_after = parse_canonical(known_after_raw, "known_after")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "known_after"})
+    if not known_before < known_after:
+        raise errors.invalid_known_order(known_before, known_after)
+
+    with read_conn() as conn:
+        proc = _fetch_procedure(conn, number) if number else None
+        if proc is None:
+            raise DomainError("not_found", f"规程编号 {number or '(空)'} 不存在",
+                              404, {"number": number})
+
+        before_rows = _visible_versions(conn, proc["id"], known_before)
+        after_rows = _visible_versions(conn, proc["id"], known_after)
+
+        # 任一版本（含对某侧不可见的版本）的区间端点都可能是有效正文切换点，
+        # 故用两侧并集的全部端点切分作业区间；片段内部两侧版本各自恒定。
+        all_rows = {v["id"]: v for v in before_rows}
+        for v in after_rows:
+            all_rows.setdefault(v["id"], v)
+        depth_cache: dict[int, int] = {}
+
+        bounds = {work_start, work_end}
+        for v in all_rows.values():
+            if v["valid_end"] <= work_start or work_end <= v["valid_start"]:
+                continue                        # 与作业区间不相交
+            bounds.add(max(v["valid_start"], work_start))
+            bounds.add(min(v["valid_end"], work_end))
+        ordered = sorted(bounds)
+
+        raw: list[tuple[str, str, int | None, int | None]] = []
+        for s, e in zip(ordered, ordered[1:]):
+            lv = _effective_at(s, before_rows, all_rows, depth_cache)
+            rv = _effective_at(s, after_rows, all_rows, depth_cache)
+            raw.append((s, e, lv["id"] if lv is not None else None,
+                        rv["id"] if rv is not None else None))
+
+        # 合并相邻且两侧版本相同的片段，再剔除两侧版本相同（含均为空）的片段。
+        segments: list[dict] = []
+        for s, e, lid, rid in _merge_adjacent(raw):
+            if lid == rid:
+                continue
+            lv = all_rows.get(lid) if lid is not None else None
+            rv = all_rows.get(rid) if rid is not None else None
+            segments.append({
+                "start": s,
+                "end": e,
+                "before": None if lv is None else {
+                    "revision": lv["revision"], "body": lv["body"]},
+                "after": None if rv is None else {
+                    "revision": rv["revision"], "body": rv["body"]},
+            })
+
+    return {"number": number,
+            "known_before": known_before,
+            "known_after": known_after,
+            "work_start": work_start,
+            "work_end": work_end,
+            "count": len(segments),
+            "segments": segments}
