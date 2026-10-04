@@ -1,0 +1,25 @@
+services:
+  sop-history:
+    build: .
+    image: sop-history:1.0.0
+    container_name: sop-history
+    restart: unless-stopped
+    ports:
+      # 宿主机端口:容器端口，可通过 SOP_PORT 调整容器侧
+      - "${SOP_PORT:-8080}:8080"
+    environment:
+      # 数据库文件位于挂载卷中，容器重建后数据保留
+      SOP_DB_PATH: /data/sop.db
+      SOP_HOST: 0.0.0.0
+      SOP_PORT: "8080"
+      SOP_BUSY_TIMEOUT_MS: "5000"
+    volumes:
+      - sop-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request;r=urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=2);raise SystemExit(0 if json.load(r)['status']=='ok' else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  sop-data:
